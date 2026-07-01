@@ -552,9 +552,22 @@ app.post('/scrape', async (req: Request, res: Response) => {
       .status(500)
       .json({ error: 'An error occurred while fetching the page.' });
   } finally {
-    if (page) await page.close();
-    if (requestContext) await requestContext.close();
+    // Release the permit BEFORE attempting cleanup. The close() calls below can
+    // hang on an overloaded/wedged browser; gating release behind them leaks a
+    // permit on every hang until the semaphore drains to zero and every request
+    // blocks forever at acquire(). The response has already been sent above, so
+    // a slow close only leaks a page/context resource — never a permit.
     pageSemaphore.release();
+    try {
+      if (page) await page.close();
+    } catch (error) {
+      console.warn('Failed to close page:', error);
+    }
+    try {
+      if (requestContext) await requestContext.close();
+    } catch (error) {
+      console.warn('Failed to close context:', error);
+    }
   }
 });
 
