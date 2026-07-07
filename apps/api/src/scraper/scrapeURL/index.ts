@@ -22,6 +22,7 @@ import {
   getEngineMaxReasonableTime,
   scrapeURLWithEngine,
   shouldUseIndex,
+  useFireEngine,
 } from "./engines";
 import { parseMarkdown } from "../../lib/html-to-markdown";
 import { hasFormatOfType } from "../../lib/format-utils";
@@ -1249,6 +1250,22 @@ export async function scrapeURL(
             if (meta.documentPrefetch !== undefined) {
               meta.logger.error(
                 "Document was prefetched and still blocked by antibot, failing",
+              );
+              throw error;
+            } else if (!useFireEngine) {
+              // The only recovery for a document anti-bot block is to re-fetch
+              // the document via a chrome-cdp prefetch, which is a fire-engine
+              // capability. Without fire-engine (self-hosted) that retry can
+              // never succeed: dropping the "document" flag just lets fetch
+              // re-download the same response, specialtyScrapeCheck re-adds the
+              // flag, and we ping-pong until the retry limit — surfacing a
+              // misleading SCRAPE_RETRY_LIMIT(document_antibot) instead of the
+              // real cause. This also covers the case where a non-document HTML
+              // page (e.g. an anti-bot challenge) was misclassified as a
+              // document: there is no prefetch engine to get past it, so fail
+              // fast and honestly on the first occurrence.
+              meta.logger.warn(
+                "Document blocked by anti-bot and no fire-engine is available to prefetch it; failing without retry",
               );
               throw error;
             } else {
