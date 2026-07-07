@@ -8,7 +8,6 @@ import {
   Page,
 } from 'playwright';
 import dotenv from 'dotenv';
-import UserAgent from 'user-agents';
 import { getError } from './helpers/get_error';
 import { lookup } from 'dns/promises';
 import IPAddr from 'ipaddr.js';
@@ -186,6 +185,14 @@ interface UrlModel {
 
 let browser: Browser;
 
+// Cached desktop User-Agent derived from the actual bundled Chromium build.
+// Using the real UA (with the "HeadlessChrome" token rewritten to "Chrome")
+// keeps the reported browser/version consistent with the TLS + JS fingerprint.
+// Generating a random UA (as the `user-agents` package does) produces
+// version/platform combinations that don't match the real browser and is an
+// immediate tell for bot-management systems like Cloudflare.
+let defaultUserAgent: string | null = null;
+
 const initializeBrowser = async () => {
   browser = await chromium.launch({
     headless: true,
@@ -197,8 +204,89 @@ const initializeBrowser = async () => {
       '--no-first-run',
       '--no-zygote',
       '--disable-gpu',
+      // Hide the primary automation signal: without this, Chromium exposes
+      // navigator.webdriver === true and sets the AutomationControlled blink
+      // feature, both of which bot-management scripts check for directly.
+      '--disable-blink-features=AutomationControlled',
     ],
   });
+};
+
+// JS evasions injected into every page before any site script runs. These
+// paper over the most commonly fingerprinted differences between a headless
+// automated Chromium and a real desktop browser. This is best-effort: it does
+// not defeat TLS/IP-reputation checks (use a residential proxy via PROXY_SERVER
+// for that), but it clears the cheap client-side headless detections.
+const STEALTH_INIT_SCRIPT = `
+(() => {
+  // navigator.webdriver -> undefined (the single biggest tell)
+  try {
+    Object.defineProperty(Object.getPrototypeOf(navigator), 'webdriver', {
+      get: () => undefined,
+    });
+  } catch (_) {}
+
+  // Realistic language list
+  try {
+    Object.defineProperty(navigator, 'languages', {
+      get: () => ['en-US', 'en'],
+    });
+  } catch (_) {}
+
+  // Non-empty plugins/mimeTypes (headless reports zero)
+  try {
+    const fakePlugins = [
+      { name: 'Chrome PDF Plugin' },
+      { name: 'Chrome PDF Viewer' },
+      { name: 'Native Client' },
+    ];
+    Object.defineProperty(navigator, 'plugins', {
+      get: () => fakePlugins,
+    });
+  } catch (_) {}
+
+  // window.chrome runtime object present in real Chrome
+  try {
+    if (!window.chrome) {
+      window.chrome = { runtime: {} };
+    }
+  } catch (_) {}
+
+  // Notification permission query consistency (headless returns "denied"
+  // while Notification.permission is "default")
+  try {
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) =>
+      parameters && parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery(parameters);
+  } catch (_) {}
+
+  // WebGL vendor/renderer spoof (headless/SwiftShader is fingerprintable)
+  try {
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function (parameter) {
+      if (parameter === 37445) return 'Intel Inc.'; // UNMASKED_VENDOR_WEBGL
+      if (parameter === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+      return getParameter.apply(this, [parameter]);
+    };
+  } catch (_) {}
+})();
+`;
+
+// Reads the real bundled-Chromium UA once and strips the headless token so the
+// reported version stays in lockstep with the actual browser.
+const getDefaultUserAgent = async (): Promise<string> => {
+  if (defaultUserAgent) return defaultUserAgent;
+  const probeContext = await browser.newContext();
+  try {
+    const probePage = await probeContext.newPage();
+    const ua = await probePage.evaluate(() => navigator.userAgent);
+    defaultUserAgent = ua.replace(/HeadlessChrome/i, 'Chrome');
+  } finally {
+    await probeContext.close();
+  }
+  return defaultUserAgent!;
 };
 
 const createContext = async (
@@ -208,7 +296,7 @@ const createContext = async (
   context: BrowserContext;
   securityState: ContextSecurityState;
 }> => {
-  const userAgent = userAgentOverride || new UserAgent().toString();
+  const userAgent = userAgentOverride || (await getDefaultUserAgent());
   const viewport = { width: 1280, height: 800 };
   const securityState: ContextSecurityState = {
     blockedNavigationRequestUrl: null,
@@ -219,6 +307,15 @@ const createContext = async (
     viewport,
     ignoreHTTPSErrors: skipTlsVerification,
     serviceWorkers: 'block',
+    // A real desktop browser reports a locale and timezone; the defaults for a
+    // barebones headless context are a fingerprintable combination.
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+    // Sensible desktop defaults. Per-request headers (set later via
+    // setExtraHTTPHeaders) still win for anything explicitly provided.
+    extraHTTPHeaders: {
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
   };
 
   contextOptions.proxy = {
@@ -226,6 +323,7 @@ const createContext = async (
   };
 
   const newContext = await browser.newContext(contextOptions);
+  await newContext.addInitScript(STEALTH_INIT_SCRIPT);
 
   if (BLOCK_MEDIA) {
     await newContext.route(
