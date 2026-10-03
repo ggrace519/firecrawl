@@ -65,8 +65,15 @@ export function getModel(
   const modelName = options?.ignoreModelOverride
     ? name
     : config.MODEL_NAME || name;
-  // o3-mini returns empty text via the Responses API — force Chat Completions
-  if (provider === "openai" && modelName.startsWith("o3-mini")) {
+  // The OpenAI provider defaults to the Responses API, but it doesn't always
+  // honor json_schema structured output there: o3-mini returns empty text, and
+  // many OpenAI-compatible self-hosted servers (configured via OPENAI_BASE_URL)
+  // implement /v1/responses but ignore the schema, returning free-form prose.
+  // Both enforce structured output correctly via Chat Completions, so force it.
+  if (
+    provider === "openai" &&
+    (modelName.startsWith("o3-mini") || config.OPENAI_BASE_URL)
+  ) {
     return withUsageTelemetry(providerList.openai.chat(modelName));
   }
   return withUsageTelemetry(providerList[provider](modelName));
