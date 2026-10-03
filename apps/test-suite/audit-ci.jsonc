@@ -2,11 +2,12 @@
     "$schema": "https://github.com/IBM/audit-ci/raw/main/docs/schema.json",
     "low": true,
     "allowlist": [
-        // GHSA-h67p-54hq-rp68 (js-yaml):
-        // artillery still depends on js-yaml 3.x; the non-affected release is 4.x,
-        // so avoid a major-crossing override in load-test tooling.
+        // GHSA-8cw4-87c7-c6xx (csv-parse):
+        // artillery 2.x still depends on csv-parse 4.x; the non-affected
+        // line is csv-parse 7.x, a multi-major jump outside the upstream range.
+        // Do not override across majors without compatibility approval.
         // Owner: team-engineering-reviewers. Tracking: create internal ticket.
-        // Expires: 2026-06-30.
-        "GHSA-h67p-54hq-rp68"
+        // Expires: 2026-10-08.
+        "GHSA-8cw4-87c7-c6xx"
     ]
 }

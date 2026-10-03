@@ -1,10 +1,11 @@
 import { v7 as uuidv7 } from "uuid";
-import { NotificationType, RateLimiterMode, ScrapeJobData } from "../types";
+import { NotificationType, ScrapeJobData } from "../types";
 import {
   cleanOldConcurrencyLimitEntries,
   getConcurrencyLimitActiveJobs,
   getConcurrencyQueueJobsCount,
   getCrawlConcurrencyLimitActiveJobs,
+  getEffectiveConcurrencyLimit,
   getTeamQueueLimit,
   MAX_BACKLOG_TIMEOUT_MS,
   pushConcurrencyLimitActiveJob,
@@ -16,7 +17,6 @@ import {
 import { logger as _logger } from "../lib/logger";
 import { sendNotificationWithCustomDays } from "./notification/email_notification";
 import { shouldSendConcurrencyLimitNotification } from "./notification/notification-check";
-import { getACUCTeam } from "../controllers/auth";
 import { getJobFromGCS, removeJobFromGCS } from "../lib/gcs-jobs";
 import { Document } from "../controllers/v1/types";
 import { getCrawl } from "../lib/crawl-redis";
@@ -38,6 +38,7 @@ import {
 import { serializeTraceContext } from "../lib/otel-tracer";
 import { isSelfHosted } from "../lib/deployment";
 import { MONITOR_CHECK_STALE_TIMEOUT_MS } from "./monitoring/stale";
+import { orgIdForTeam } from "../lib/team-org";
 
 // Queue-wait deadline for a backlogged job (how long its owner still cares about the result)
 function backlogTimeoutMs(data: ScrapeJobData): number {
@@ -345,6 +346,25 @@ async function maybeSendConcurrencyNotificationFdb(
   }
 }
 
+// The org for a team's concurrency lookup. It rides the job payload,
+// snapshotted from the request ACUC at acceptance; every job here is one
+// team's, so any of them answers. The ACUC is the fallback for a job enqueued
+// without one (monitor jobs null the field deliberately — it also gates
+// blocklist enforcement), so a monitor team is still gated on its real limit
+// rather than falling open. One resolution per enqueue, never per job.
+async function orgIdForEnqueue(
+  jobs: ScrapeJobData[],
+  teamId: string,
+): Promise<string | null> {
+  return (
+    jobs
+      .map(d =>
+        "internalOptions" in d ? (d.internalOptions?.orgId ?? null) : null,
+      )
+      .find(o => o !== null) ?? (await orgIdForTeam(teamId))
+  );
+}
+
 async function addScrapeJobRaw(
   webScraperOptions: ScrapeJobData,
   jobId: string,
@@ -398,15 +418,10 @@ async function addScrapeJobRaw(
       }
     }
 
-    maxConcurrency =
-      (
-        await getACUCTeam(
-          webScraperOptions.team_id,
-          false,
-          true,
-          RateLimiterMode.Crawl,
-        )
-      )?.concurrency ?? 2;
+    maxConcurrency = await getEffectiveConcurrencyLimit(
+      webScraperOptions.team_id,
+      await orgIdForEnqueue([webScraperOptions], webScraperOptions.team_id),
+    );
 
     if (concurrencyLimited === null) {
       const now = Date.now();
@@ -699,9 +714,13 @@ export async function addScrapeJobs(
       addToCQ = jobsForcedToCQ;
     } else {
       const now = Date.now();
-      maxConcurrency =
-        (await getACUCTeam(teamId, false, true, RateLimiterMode.Scrape))
-          ?.concurrency ?? 2;
+      maxConcurrency = await getEffectiveConcurrencyLimit(
+        teamId,
+        await orgIdForEnqueue(
+          allTeamJobs.map(j => j.data),
+          teamId,
+        ),
+      );
       await cleanOldConcurrencyLimitEntries(teamId, now);
 
       currentActiveConcurrency = (

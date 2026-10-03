@@ -82,13 +82,13 @@ Before using the Java SDK, ensure you have the following installed:
 ### Gradle (Kotlin DSL)
 
 ```kotlin
-implementation("com.firecrawl:firecrawl-java:1.6.0")
+implementation("com.firecrawl:firecrawl-java:1.16.0")
 ```
 
 ### Gradle (Groovy)
 
 ```groovy
-implementation 'com.firecrawl:firecrawl-java:1.6.0'
+implementation 'com.firecrawl:firecrawl-java:1.16.0'
 ```
 
 ### Maven
@@ -97,7 +97,7 @@ implementation 'com.firecrawl:firecrawl-java:1.6.0'
 <dependency>
     <groupId>com.firecrawl</groupId>
     <artifactId>firecrawl-java</artifactId>
-    <version>1.6.0</version>
+    <version>1.16.0</version>
 </dependency>
 ```
 
@@ -178,6 +178,17 @@ Document parsed = client.parse(file,
         .build());
 
 System.out.println(parsed.getMarkdown());
+```
+
+To see which upload types the API accepts, call `getParseFormats()`. Each entry has a `format`, a `kind` (`document` or `image`), its `extensions` and `mimeTypes`, and whether it is `available` on the current deployment (image formats need image OCR enabled).
+
+```java
+import com.firecrawl.models.ParseFormat;
+
+for (ParseFormat format : client.getParseFormats()) {
+    System.out.println(format.getFormat() + " " + format.getKind()
+        + " " + format.getExtensions() + " available=" + format.isAvailable());
+}
 ```
 
 #### JSON Extraction
@@ -430,14 +441,14 @@ gradle build
 
 ```bash
 gradle jar
-# Output: build/libs/firecrawl-java-1.6.0.jar
+# Output: build/libs/firecrawl-java-1.16.0.jar
 ```
 
 ### Install Locally
 
 ```bash
 gradle publishToMavenLocal
-# Now available as: com.firecrawl:firecrawl-java:1.6.0 in local Maven repository
+# Now available as: com.firecrawl:firecrawl-java:1.16.0 in local Maven repository
 ```
 
 ## Running Tests

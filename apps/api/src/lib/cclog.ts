@@ -1,6 +1,4 @@
 import type IORedis from "ioredis";
-import { db } from "../db/connection";
-import * as schema from "../db/schema";
 import { logger as _logger } from "./logger";
 import {
   nuqFdbHealthCheck,
@@ -8,6 +6,7 @@ import {
   withFdbTimeout,
 } from "../services/worker/nuq-fdb";
 import { fdbQueueEnabled } from "../services/worker/nuq-router";
+import { chInsert } from "./clickhouse-client";
 
 const FDB_OPTIONAL_COUNT_TIMEOUT_MS = 500;
 const CONCURRENCY_LIMITER_KEY_PATTERN = "concurrency-limiter:*";
@@ -18,6 +17,11 @@ const CCLOG_SAMPLE_TTL_SECONDS = 60 * 60;
 const CCLOG_MINUTE_MS = 60 * 1000;
 const CCLOG_AGGREGATE_INTERVAL_MINUTES = 10;
 
+// Dragonfly rejects commands with more than 2^16 arguments ("invalid
+// multibulk length") and drops the connection, so a single HSET silently
+// fails once a sample holds ~32k+ teams. Chunk well below that limit.
+const CCLOG_HSET_FIELD_CHUNK_SIZE = 16000;
+
 type CclogSample = {
   at: Date;
   concurrencyByTeam: Map<string, number>;
@@ -25,7 +29,8 @@ type CclogSample = {
 
 type CclogAggregateEntry = {
   team_id: string;
-  concurrency: number;
+  avg_concurrency: number;
+  max_concurrency: number;
   created_at: string;
 };
 
@@ -127,19 +132,31 @@ async function saveCclogMinuteSample(
   const pipeline = redis.pipeline();
 
   if (sample.concurrencyByTeam.size > 0) {
-    const values: Record<string, string> = {};
+    let values: Record<string, string> = {};
 
     for (const [teamId, concurrency] of sample.concurrencyByTeam) {
       values[teamId] = String(concurrency);
+
+      if (Object.keys(values).length >= CCLOG_HSET_FIELD_CHUNK_SIZE) {
+        pipeline.hset(key, values);
+        values = {};
+      }
     }
 
-    pipeline.hset(key, values);
+    if (Object.keys(values).length > 0) {
+      pipeline.hset(key, values);
+    }
   } else {
     pipeline.hset(key, "__empty__", "0");
   }
 
   pipeline.expire(key, CCLOG_SAMPLE_TTL_SECONDS);
-  await pipeline.exec();
+
+  const results = await pipeline.exec();
+  const error = (results ?? []).find(([err]) => err)?.[0];
+  if (error) {
+    throw new Error(`Failed to save cclog minute sample: ${error.message}`);
+  }
 }
 
 async function buildCclogAggregateEntries(
@@ -163,25 +180,40 @@ async function buildCclogAggregateEntries(
   }
 
   const created_at = floorToMinute(at).toISOString();
-  return Array.from(teamIds).map(team_id => {
+  const entries: CclogAggregateEntry[] = [];
+
+  for (const team_id of teamIds) {
     let total = 0;
+    let maxConcurrency = 0;
 
     for (const sample of samples) {
-      total += Number.parseInt(sample[team_id] ?? "0", 10);
+      const concurrency = Number.parseInt(sample[team_id] ?? "0", 10);
+      total += concurrency;
+      maxConcurrency = Math.max(maxConcurrency, concurrency);
     }
 
-    return {
+    const avgConcurrency = Math.round(total / CCLOG_AGGREGATE_INTERVAL_MINUTES);
+    if (avgConcurrency === 0 && maxConcurrency === 0) {
+      continue;
+    }
+
+    entries.push({
       team_id,
-      concurrency: Math.round(total / CCLOG_AGGREGATE_INTERVAL_MINUTES),
+      avg_concurrency: avgConcurrency,
+      max_concurrency: maxConcurrency,
       created_at,
-    };
-  });
+    });
+  }
+
+  return entries;
 }
 
-async function insertCclogAggregate(entries: CclogAggregateEntry[]) {
-  if (entries.length === 0) return;
+async function insertCclogAggregate(
+  entries: CclogAggregateEntry[],
+): Promise<boolean> {
+  if (entries.length === 0) return true;
 
-  await db.insert(schema.concurrency_log).values(entries);
+  return chInsert("concurrency_logs", entries, { throwOnError: true });
 }
 
 export async function runCclogTick(redis: IORedis, at = new Date()) {
@@ -210,12 +242,18 @@ export async function runCclogTick(redis: IORedis, at = new Date()) {
   let insertedRows = 0;
 
   try {
-    await insertCclogAggregate(entries);
-    insertedRows = entries.length;
-    logger.info("Inserted cclog aggregate", {
-      at: minute.toISOString(),
-      rows: insertedRows,
-    });
+    if (await insertCclogAggregate(entries)) {
+      insertedRows = entries.length;
+      logger.info("Inserted cclog aggregate", {
+        at: minute.toISOString(),
+        rows: insertedRows,
+      });
+    } else {
+      logger.warn("Skipped cclog aggregate insert", {
+        at: minute.toISOString(),
+        rows: entries.length,
+      });
+    }
   } catch (error) {
     logger.error("Error inserting cclog aggregate", { error });
   }

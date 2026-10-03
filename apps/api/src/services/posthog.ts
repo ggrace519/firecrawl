@@ -3,52 +3,9 @@ import { redisEvictConnection } from "./redis";
 import { dbRr } from "../db/connection";
 import * as schema from "../db/schema";
 import { logger as _logger } from "../lib/logger";
+import { capturePostHog, isPostHogCaptureEnabled } from "./posthog-capture";
 
-/**
- * Lightweight, dependency-free PostHog capture for the API.
- *
- * The API has no PostHog SDK wired up, so we POST directly to the capture
- * endpoint. Everything here is best-effort and fire-and-forget: a missing key
- * or a network error must never affect request handling.
- *
- * Configure via env:
- *   POSTHOG_API_KEY  — project API key (if unset, capture is a no-op)
- *   POSTHOG_HOST     — ingestion host (defaults to https://us.i.posthog.com)
- */
-const POSTHOG_API_KEY = process.env.POSTHOG_API_KEY;
-const POSTHOG_HOST = process.env.POSTHOG_HOST || "https://us.i.posthog.com";
-
-function capturePostHog(
-  event: string,
-  distinctId: string,
-  properties: Record<string, unknown> = {},
-): void {
-  if (!POSTHOG_API_KEY) return;
-
-  // Fire-and-forget — do not await in the request path, never throw.
-  void (async () => {
-    try {
-      await fetch(`${POSTHOG_HOST.replace(/\/$/, "")}/capture/`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          api_key: POSTHOG_API_KEY,
-          event,
-          distinct_id: distinctId,
-          properties,
-        }),
-      });
-    } catch (error) {
-      _logger.debug("PostHog capture failed", {
-        module: "posthog",
-        event,
-        error,
-      });
-    }
-  })();
-}
-
-/** Normalized request surface, derived from the free-form `origin` field. */
+/** Normalized request surface, derived from the `origin` + `integration` fields. */
 type RequestSurface =
   | "playground"
   | "sdk"
@@ -59,18 +16,27 @@ type RequestSurface =
   | "other";
 
 /**
- * Map the free-form `origin` request field to a coarse surface category.
+ * Map a request's `origin` + `integration` fields to a coarse surface category.
  *
- * `origin` is client-set (defaults to "api"); these are the values observed in
- * practice. NOTE: confirm the exact strings sent by firecrawl-mcp and
- * firecrawl-cli — adjust the prefixes below if they differ.
+ * Both are client-set. `origin` (defaults to "api") carries the SDK
+ * (`*-sdk@ver`, `api-sdk`), MCP (`mcp` / `mcp-fastmcp`), playground (`website`),
+ * and `monitor`. The CLI is the exception: it sets `integration: "cli"` on every
+ * command but leaves `origin` at the "api" default on its high-volume commands
+ * (scrape/crawl/search/map/agent/parse/browser) — only feedback/interact/
+ * search-feedback also set `origin: "cli"`. So CLI must be detected via
+ * `integration`, or the bulk of CLI traffic is miscounted as `api`. (Verified
+ * against firecrawl/cli.)
  */
-function originToSurface(origin?: string | null): RequestSurface {
+function originToSurface(
+  origin?: string | null,
+  integration?: string | null,
+): RequestSurface {
   const o = (origin ?? "").toLowerCase();
+  const i = (integration ?? "").toLowerCase();
+  if (i === "cli" || o === "cli") return "cli";
   if (o === "website" || o.includes("playground")) return "playground";
   if (o.startsWith("mcp")) return "mcp";
-  if (o.startsWith("cli") || o.includes("firecrawl-cli")) return "cli";
-  if (o.includes("sdk")) return "sdk"; // e.g. "api-sdk"
+  if (o.includes("sdk")) return "sdk"; // e.g. "api-sdk", "js-sdk@x"
   if (o.startsWith("monitor")) return "monitor";
   if (o === "api") return "api";
   return "other";
@@ -109,6 +75,20 @@ async function resolveDistinctId(
   }
 }
 
+/** The org a team belongs to, for the PostHog `company` ($group_0) group. */
+async function resolveOrgId(teamId: string): Promise<string | null> {
+  try {
+    const rows = await dbRr
+      .select({ orgId: schema.teams.org_id })
+      .from(schema.teams)
+      .where(eq(schema.teams.id, teamId))
+      .limit(1);
+    return rows[0]?.orgId ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Emit a one-time `api_surface_first_used` event the first time a team makes a
  * request from a given surface (playground / sdk / mcp / cli / api / ...).
@@ -128,23 +108,24 @@ async function resolveDistinctId(
 export function trackFirstSurfaceUse(args: {
   teamId: string;
   origin?: string | null;
+  integration?: string | null;
   kind: string;
   apiVersion: string;
   apiKeyId?: number | null;
 }): void {
-  const { teamId, origin, kind, apiVersion, apiKeyId } = args;
+  const { teamId, origin, integration, kind, apiVersion, apiKeyId } = args;
 
   // No PostHog key → capture is a no-op. Bail BEFORE the Redis SETNX so we don't
   // burn the dedup marker without emitting (which would lose the milestone for
   // good once PostHog is enabled).
-  if (!POSTHOG_API_KEY) return;
+  if (!isPostHogCaptureEnabled()) return;
 
   // Skip anonymous / preview traffic — not a real team milestone.
   if (!teamId || teamId === "preview" || teamId.startsWith("preview_")) return;
 
   void (async () => {
     try {
-      const surface = originToSurface(origin);
+      const surface = originToSurface(origin, integration);
       const key = `firecrawl:surface_first:${teamId}:${surface}`;
       // SET key 1 NX → "OK" only the very first time; null otherwise. Atomic.
       const isFirst = await redisEvictConnection.set(key, "1", "NX");
@@ -152,17 +133,24 @@ export function trackFirstSurfaceUse(args: {
 
       // Key to the person (api-key owner email) so the event attributes to the
       // same PostHog person the dashboard identifies, e.g. for experiments.
-      const distinctId = await resolveDistinctId(teamId, apiKeyId);
+      const [distinctId, orgId] = await Promise.all([
+        resolveDistinctId(teamId, apiKeyId),
+        resolveOrgId(teamId),
+      ]);
 
-      capturePostHog("api_surface_first_used", distinctId, {
+      const sent = await capturePostHog("api_surface_first_used", distinctId, {
         surface,
         raw_origin: origin ?? null,
+        raw_integration: integration ?? null,
         kind,
         api_version: apiVersion,
         team_id: teamId,
-        // Associate with the PostHog `team` group for team-level analysis.
-        $groups: { team: teamId },
+        // Associate with the PostHog `team` ($group_1) and, when resolvable, the
+        // `company` ($group_0) groups for group-level analysis.
+        $groups: { team: teamId, ...(orgId ? { company: orgId } : {}) },
       });
+      // A rejected capture must not use up the one-time milestone.
+      if (!sent) await redisEvictConnection.del(key);
     } catch (error) {
       _logger.debug("trackFirstSurfaceUse failed", {
         module: "posthog",

@@ -1,11 +1,11 @@
 import { Logger } from "winston";
 import { validate as isUUID } from "uuid";
-import { getACUCTeam } from "../controllers/auth";
 import { getRedisConnection } from "../services/queue-service";
 import { scrapeQueue, type NuQJob } from "../services/worker/nuq";
-import { RateLimiterMode, type ScrapeJobData } from "../types";
+import { type ScrapeJobData } from "../types";
 import {
   getConcurrencyLimitActiveJobs,
+  getEffectiveConcurrencyLimit,
   getNextConcurrentJob,
   MAX_BACKLOG_TIMEOUT_MS,
   pushConcurrencyLimitActiveJob,
@@ -16,6 +16,7 @@ import {
 } from "./concurrency-limit";
 import { getCrawl } from "./crawl-redis";
 import { logger as _logger } from "./logger";
+import { orgIdForTeam } from "./team-org";
 
 interface ReconcileOptions {
   teamId?: string;
@@ -82,6 +83,7 @@ async function getQueuedJobIDs(teamId: string): Promise<Set<string>> {
 
 async function reconcileTeam(
   ownerId: string,
+  orgId: string | null,
   teamLogger: Logger,
 ): Promise<{ jobsStarted: number; jobsRequeued: number } | null> {
   const backloggedJobIDs = new Set(
@@ -106,12 +108,14 @@ async function reconcileTeam(
     return null;
   }
 
-  const maxCrawlConcurrency =
-    (await getACUCTeam(ownerId, false, true, RateLimiterMode.Crawl))
-      ?.concurrency ?? 2;
-  const maxExtractConcurrency =
-    (await getACUCTeam(ownerId, false, true, RateLimiterMode.Extract))
-      ?.concurrency ?? 2;
+  // Autumn's CONCURRENCY balance is a single per-team pool, so crawl and
+  // extract share the same effective limit.
+  // TODO: gate crawl + extract against one combined pool (sum of both active
+  // counts vs the single limit) instead of applying the same limit to each
+  // type independently.
+  const teamConcurrency = await getEffectiveConcurrencyLimit(ownerId, orgId);
+  const maxCrawlConcurrency = teamConcurrency;
+  const maxExtractConcurrency = teamConcurrency;
 
   // Split active count by type so one type's active jobs don't gate the other
   const activeJobIds = await getConcurrencyLimitActiveJobs(ownerId);
@@ -199,14 +203,17 @@ async function reconcileTeam(
 
 async function drainQueue(
   ownerId: string,
+  orgId: string | null,
   teamLogger: Logger,
 ): Promise<{ jobsPromoted: number; staleSkipped: number }> {
-  const maxCrawlConcurrency =
-    (await getACUCTeam(ownerId, false, true, RateLimiterMode.Crawl))
-      ?.concurrency ?? 2;
-  const maxExtractConcurrency =
-    (await getACUCTeam(ownerId, false, true, RateLimiterMode.Extract))
-      ?.concurrency ?? 2;
+  // Autumn's CONCURRENCY balance is a single per-team pool, so crawl and
+  // extract share the same effective limit.
+  // TODO: gate crawl + extract against one combined pool (sum of both active
+  // counts vs the single limit) instead of applying the same limit to each
+  // type independently.
+  const teamConcurrency = await getEffectiveConcurrencyLimit(ownerId, orgId);
+  const maxCrawlConcurrency = teamConcurrency;
+  const maxExtractConcurrency = teamConcurrency;
 
   const activeIds = await getConcurrencyLimitActiveJobs(ownerId);
   const activeJobs = await scrapeQueue.getJobs(activeIds, teamLogger);
@@ -331,14 +338,19 @@ export async function reconcileConcurrencyQueue(
     const teamLogger = logger.child({ teamId: ownerId });
 
     try {
-      const teamResult = await reconcileTeam(ownerId, teamLogger);
+      // The reconciler has no request ACUC and no job payload to read, so the
+      // team's ACUC is the only org source; once per team per pass, shared by
+      // both limit lookups below.
+      const orgId = await orgIdForTeam(ownerId);
+
+      const teamResult = await reconcileTeam(ownerId, orgId, teamLogger);
       if (teamResult !== null) {
         result.teamsWithDrift++;
         result.jobsStarted += teamResult.jobsStarted;
         result.jobsRequeued += teamResult.jobsRequeued;
       }
 
-      const drainResult = await drainQueue(ownerId, teamLogger);
+      const drainResult = await drainQueue(ownerId, orgId, teamLogger);
       if (drainResult.jobsPromoted > 0 || drainResult.staleSkipped > 0) {
         result.jobsStarted += drainResult.jobsPromoted;
         teamLogger.info("Queue drain promoted jobs", {

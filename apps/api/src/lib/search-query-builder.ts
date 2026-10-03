@@ -4,7 +4,7 @@
  */
 
 interface CategoryInput {
-  type: "github" | "research" | "pdf";
+  type: "github" | "research" | "pdf" | "developer";
   sites?: string[];
 }
 
@@ -37,6 +37,16 @@ const DEFAULT_RESEARCH_SITES = [
   "biorxiv.org",
   "medrxiv.org",
 ];
+
+export function hasCategory(
+  categories: unknown,
+  type: CategoryInput["type"],
+): boolean {
+  return (
+    Array.isArray(categories) &&
+    categories.some(c => (typeof c === "string" ? c : c?.type) === type)
+  );
+}
 
 /**
  * Builds a search query with category filters
@@ -102,9 +112,11 @@ export function buildSearchQuery(
 
   const includeDomains = domainOptions.includeDomains ?? [];
   const excludeDomains = domainOptions.excludeDomains ?? [];
+  // Bare `site:` operators, not a parenthesized group: some backends don't
+  // parse `(site:foo.com)` and drop the filter, leaking off-domain results.
   const includeFilter =
     includeDomains.length > 0
-      ? " (" + includeDomains.map(domain => `site:${domain}`).join(" OR ") + ")"
+      ? " " + includeDomains.map(domain => `site:${domain}`).join(" OR ")
       : "";
   const excludeFilter =
     excludeDomains.length > 0

@@ -333,6 +333,8 @@ pub struct JsonOptions {
     pub system_prompt: Option<String>,
     /// Extraction prompt for the LLM agent.
     pub prompt: Option<String>,
+    /// Whether to check scraped content for prompt-injection attempts before extraction.
+    pub check_prompt_injection: Option<bool>,
 }
 
 /// Location configuration for proxy routing.
@@ -690,6 +692,59 @@ pub struct Document {
     pub product: Option<Product>,
     /// Menu extraction result.
     pub menu: Option<Menu>,
+    /// Physical PDF page markdown, present only when `parsers[].pages` is true.
+    pub pages: Option<Vec<PdfPage>>,
+    /// Typed PDF layout blocks, present only when `parsers[].blocks` is true.
+    pub blocks: Option<Vec<PdfPageBlocks>>,
+    /// Alexandria domain tools discovered and matched for this document.
+    pub tools: Option<Vec<DiscoveredTool>>,
+}
+
+/// Physical markdown for a single PDF page.
+#[serde_with::skip_serializing_none]
+#[derive(Deserialize, Serialize, Debug, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfPage {
+    pub page_number: u32,
+    pub markdown: String,
+}
+
+/// Layout and OCR confidence scores for a PDF block.
+#[serde_with::skip_serializing_none]
+#[derive(Deserialize, Serialize, Debug, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfBlockConfidence {
+    pub layout: Option<f64>,
+    pub ocr: Option<f64>,
+}
+
+/// A typed PDF layout block (bounding box, type, reading order).
+#[serde_with::skip_serializing_none]
+#[derive(Deserialize, Serialize, Debug, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfBlockItem {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub block_type: String,
+    pub label: Option<String>,
+    pub bbox: Option<[f64; 4]>,
+    pub content: String,
+    pub markdown_span: Option<[i64; 2]>,
+    pub reading_order: i64,
+    pub source: Option<String>,
+    pub confidence: PdfBlockConfidence,
+}
+
+/// Typed layout blocks for a single PDF page.
+#[serde_with::skip_serializing_none]
+#[derive(Deserialize, Serialize, Debug, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfPageBlocks {
+    pub page_number: u32,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    pub status: String,
+    pub items: Vec<PdfBlockItem>,
 }
 
 /// Product extraction result for a page.
@@ -936,10 +991,43 @@ pub enum SitemapMode {
 #[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentModel {
+    /// Deprecated: the server runs spark-2 for this value.
     #[serde(rename = "spark-1-pro")]
     Spark1Pro,
+    /// Deprecated: the server runs spark-2 for this value.
     #[serde(rename = "spark-1-mini")]
     Spark1Mini,
+    #[serde(rename = "spark-2")]
+    Spark2,
+    /// A model this SDK release does not know about.
+    ///
+    /// Read-only catch-all: the server ships models without an SDK release, so
+    /// an exhaustive enum would fail the whole `AgentStatusResponse` parse — and
+    /// therefore the status wait loop — the first time an unrecognized name came
+    /// back. Do not send this variant in a request; it serializes to `"unknown"`,
+    /// which the API rejects.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Agent reasoning effort. Every level runs spark-2; the effort sets the
+/// reasoning budget inside it.
+#[derive(Deserialize, Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentEffort {
+    Low,
+    Medium,
+    High,
+    /// An effort level this SDK release does not know about.
+    ///
+    /// Read-only catch-all, same rationale as `AgentModel::Unknown`: the
+    /// server ships effort levels without an SDK release, and an exhaustive
+    /// enum would fail the whole `AgentStatusResponse` parse — and therefore
+    /// the status wait loop — the first time an unrecognized value came back.
+    /// Do not send this variant in a request; it serializes to `"unknown"`,
+    /// which the API rejects.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Search source types.
@@ -949,6 +1037,7 @@ pub enum SearchSource {
     Web,
     News,
     Images,
+    Alexandria,
 }
 
 /// Search category types.
@@ -1024,6 +1113,50 @@ pub struct CrawlErrorsResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_agent_model_round_trips_every_known_model() {
+        for (name, expected) in [
+            ("spark-2", AgentModel::Spark2),
+            ("spark-1-pro", AgentModel::Spark1Pro),
+            ("spark-1-mini", AgentModel::Spark1Mini),
+        ] {
+            let parsed: AgentModel = serde_json::from_str(&format!("\"{name}\""))
+                .unwrap_or_else(|e| panic!("{name} should deserialize: {e}"));
+            assert_eq!(parsed, expected);
+            assert_eq!(
+                serde_json::to_string(&expected).unwrap(),
+                format!("\"{name}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn test_agent_model_unknown_degrades_instead_of_failing_the_parse() {
+        // /v2/agent/:id always returns `model`. A model the server ships before
+        // this SDK knows about must not take down status polling.
+        let parsed: AgentModel = serde_json::from_str("\"spark-9-unreleased\"")
+            .expect("unknown model should deserialize");
+        assert_eq!(parsed, AgentModel::Unknown);
+    }
+
+    #[test]
+    fn test_agent_effort_unknown_degrades_instead_of_failing_the_parse() {
+        // Same as the model catch-all: an effort level the server ships before
+        // this SDK knows about must not take down status polling.
+        let parsed: AgentEffort =
+            serde_json::from_str("\"extreme\"").expect("unknown effort should deserialize");
+        assert_eq!(parsed, AgentEffort::Unknown);
+        for (name, expected) in [
+            ("low", AgentEffort::Low),
+            ("medium", AgentEffort::Medium),
+            ("high", AgentEffort::High),
+        ] {
+            let parsed: AgentEffort = serde_json::from_str(&format!("\"{name}\""))
+                .unwrap_or_else(|e| panic!("{name} should deserialize: {e}"));
+            assert_eq!(parsed, expected);
+        }
+    }
 
     #[test]
     fn test_full_document_with_array_metadata() {
@@ -1132,4 +1265,112 @@ mod tests {
         assert_eq!(item_json["availability"]["inStock"], true);
         assert_eq!(item_json["identifiers"]["merchantItemId"], "abc123");
     }
+
+    #[test]
+    fn test_document_with_blocks() {
+        let json = json!({
+            "markdown": "# Annual Report 2025",
+            "blocks": [{
+                "pageNumber": 1,
+                "width": 1700.0,
+                "height": 2200.0,
+                "status": "ok",
+                "items": [{
+                    "id": "p1.b0",
+                    "type": "title",
+                    "label": "doc_title",
+                    "bbox": [0.118, 0.054, 0.882, 0.092],
+                    "content": "# Annual Report 2025",
+                    "markdownSpan": [0, 21],
+                    "readingOrder": 0,
+                    "source": "native_text",
+                    "confidence": { "layout": 0.97, "ocr": null }
+                }]
+            }]
+        });
+        let doc: Document = serde_json::from_value(json).unwrap();
+        let pages = doc.blocks.expect("blocks should be present");
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].page_number, 1);
+        assert_eq!(pages[0].status, "ok");
+        assert_eq!(pages[0].items[0].id, "p1.b0");
+        assert_eq!(pages[0].items[0].block_type, "title");
+        assert_eq!(pages[0].items[0].reading_order, 0);
+        assert_eq!(pages[0].items[0].confidence.layout, Some(0.97));
+        assert_eq!(pages[0].items[0].confidence.ocr, None);
+    }
+
+    #[test]
+    fn test_document_with_pages() {
+        let json = json!({
+            "markdown": "# Annual Report 2025",
+            "pages": [
+                { "pageNumber": 1, "markdown": "# Cover" },
+                { "pageNumber": 2, "markdown": "## Intro" }
+            ]
+        });
+        let doc: Document = serde_json::from_value(json).unwrap();
+        let pages = doc.pages.expect("pages should be present");
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].page_number, 1);
+        assert_eq!(pages[0].markdown, "# Cover");
+        assert_eq!(pages[1].page_number, 2);
+        assert_eq!(pages[1].markdown, "## Intro");
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredTool {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub provider: String,
+    pub capability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits_cost: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_record: Option<bool>,
+    #[serde(default)]
+    pub options: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<serde_json::Value>,
+    #[serde(default)]
+    pub examples: std::collections::HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_to_use: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returns: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<serde_json::Value>,
+    #[serde(default)]
+    pub matched_by: Vec<String>,
+    #[serde(default)]
+    pub matched_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_one_of: Option<Vec<Vec<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cohorts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f64>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolDetail {
+    Compact,
+    Summary,
+    Full,
 }

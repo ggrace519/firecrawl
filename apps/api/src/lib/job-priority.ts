@@ -1,7 +1,7 @@
-import { RateLimiterMode } from "../types";
-import { getACUCTeam } from "../controllers/auth";
 import { redisEvictConnection } from "../services/redis";
 import { logger } from "./logger";
+import { autumnService } from "../services/autumn/autumn.service";
+import { inferPlanPriorityFromMultiplier } from "../services/rate-limiter";
 
 const SET_KEY_PREFIX = "limit_team_id:";
 export async function addJobPriority(team_id, job_id) {
@@ -31,9 +31,14 @@ export async function deleteJobPriority(team_id, job_id) {
 
 export async function getJobPriority({
   team_id,
+  org_id,
   basePriority = 10,
 }: {
   team_id: string;
+  /** The team's org, from the ACUC the caller already holds. Required so a
+   * caller cannot silently omit it and fall back to the high fail-open
+   * limits; pass null only when the caller genuinely has no org. */
+  org_id: string | null;
   basePriority?: number;
   from_extract?: boolean;
 }): Promise<number> {
@@ -42,21 +47,20 @@ export async function getJobPriority({
   }
 
   try {
-    const acuc = await getACUCTeam(
-      team_id,
-      false,
-      true,
-      RateLimiterMode.Scrape,
-    );
-
     const setKey = SET_KEY_PREFIX + team_id;
 
     // Get the length of the set
     const setLength = await redisEvictConnection.scard(setKey);
 
-    // Determine the priority based on the plan and set length
-    let planModifier = acuc?.plan_priority.planModifier ?? 1;
-    let bucketLimit = acuc?.plan_priority.bucketLimit ?? 25;
+    // Plan priority is inferred from the team's Autumn rate-limit multiplier.
+    // The org is threaded in by the caller: this runs once per discovered link
+    // inside a crawl, so it must not do an ACUC lookup of its own.
+    const multiplier = await autumnService.getRateLimitMultiplier(
+      team_id,
+      org_id,
+    );
+    const { bucketLimit, planModifier } =
+      inferPlanPriorityFromMultiplier(multiplier);
 
     // if length set is smaller than set, just return base priority
     if (setLength <= bucketLimit) {

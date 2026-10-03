@@ -8,6 +8,7 @@ import {
   type SearchResultImages,
 } from "../types";
 import { HttpClient } from "../utils/httpClient";
+import { agentHintMetadata } from "../utils/agentHints";
 import { ensureValidScrapeOptions } from "../utils/validation";
 import {
   throwForBadResponse,
@@ -27,6 +28,8 @@ function prepareSearchPayload(req: SearchRequest): Record<string, unknown> {
   const payload: Record<string, unknown> = {
     query: req.query,
   };
+  if (req.toolDetail != null) payload.toolDetail = req.toolDetail;
+  if (req.domainTools != null) payload.domainTools = req.domainTools;
   if (req.sources) payload.sources = req.sources;
   if (req.categories) payload.categories = req.categories;
   if (req.includeDomains) payload.includeDomains = req.includeDomains;
@@ -34,12 +37,17 @@ function prepareSearchPayload(req: SearchRequest): Record<string, unknown> {
   if (req.limit != null) payload.limit = req.limit;
   if (req.tbs != null) payload.tbs = req.tbs;
   if (req.location != null) payload.location = req.location;
+  if (req.country != null) payload.country = req.country;
   if (req.ignoreInvalidURLs != null)
     payload.ignoreInvalidURLs = req.ignoreInvalidURLs;
   if (req.timeout != null) payload.timeout = req.timeout;
+  if (req.highlights != null) payload.highlights = req.highlights;
   if (req.integration && req.integration.trim())
     payload.integration = req.integration.trim();
   if (req.origin) payload.origin = req.origin;
+  if (req.enterprise) payload.enterprise = req.enterprise;
+  if (req.threatProtection != null)
+    payload.threatProtection = req.threatProtection;
   if (req.scrapeOptions) {
     ensureValidScrapeOptions(req.scrapeOptions as ScrapeOptions);
     payload.scrapeOptions = req.scrapeOptions;
@@ -82,6 +90,7 @@ export async function search(
       success: boolean;
       data?: Record<string, unknown>;
       error?: string;
+      warning?: string;
     }>(
       "/v2/search",
       payload,
@@ -93,18 +102,25 @@ export async function search(
       throwForBadResponse(res, "search");
     }
     const data = (res.data.data || {}) as Record<string, any>;
-    const out: SearchData = {};
+    const out: SearchData = { ...agentHintMetadata(res.data) };
+    if (res.data.warning) out.warning = res.data.warning;
     if (data.web) out.web = transformArray<SearchResultWeb>(data.web);
     if (data.news) out.news = transformArray<SearchResultNews>(data.news);
     if (data.images)
       out.images = transformArray<SearchResultImages>(data.images);
+    if (data.tools) out.tools = data.tools;
     Object.defineProperty(out, "data", {
       get() {
         const parts: string[] = [];
         if (out.web?.length) parts.push(`.web (${out.web.length} results)`);
         if (out.news?.length) parts.push(`.news (${out.news.length} results)`);
-        if (out.images?.length) parts.push(`.images (${out.images.length} results)`);
-        const available = parts.length ? parts.join(", ") : ".web, .news, or .images";
+        if (out.images?.length)
+          parts.push(`.images (${out.images.length} results)`);
+        if (out.tools?.length)
+          parts.push(`.tools (${out.tools.length} results)`);
+        const available = parts.length
+          ? parts.join(", ")
+          : ".web, .news, .images, or .tools";
         throw new Error(
           `SearchData has no '.data'. Results are grouped by source: ${available}`,
         );

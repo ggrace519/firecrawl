@@ -61,3 +61,9 @@ _local/
 
 
 apps/api/src/lib/scrape-interact/*.md
+.pnpm-store
+
+# stray test runner logs
+vitest.out
+
+tmp/
