@@ -2,8 +2,8 @@
 # pushes them to ghcr.io/<owner>/. Upstream's deploy-*.yml workflows publish
 # to ghcr.io/firecrawl and are disabled on the fork.
 #
-# Tags: the branch name (develop), sha-<short>, and on develop also the
-# upstream release the branch is based on (e.g. v2.11.534).
+# Tags: the branch name (develop), which moves to every new build, and
+# sha-<short>, which always names one build (use it to pin or roll back).
 name: Fork Build Images to GHCR
 
 on:
@@ -41,18 +41,12 @@ jobs:
             context: ./apps/nuq-postgres
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
-      - name: Resolve image name and upstream release
+      - name: Resolve image name
         id: base
         run: |
           owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
           echo "image=ghcr.io/${owner}/${{ matrix.image }}" >> "$GITHUB_OUTPUT"
-          # The fork doesn't carry upstream's release tags; fetch them to find
-          # the release develop was last synced to.
-          git fetch --no-tags https://github.com/firecrawl/firecrawl.git 'refs/tags/v*:refs/tags/v*'
-          echo "release=$(git describe --tags --abbrev=0 --match 'v*' HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: docker/metadata-action@v5
         id: meta
@@ -61,7 +55,6 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha,prefix=sha-
-            type=raw,value=${{ steps.base.outputs.release }},enable=${{ github.ref == 'refs/heads/develop' }}
 
       - uses: docker/setup-buildx-action@v3
 
