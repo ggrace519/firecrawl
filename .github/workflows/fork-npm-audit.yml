@@ -1,0 +1,38 @@
+# Fork-owned: weekly audit of the packages this fork deploys. Upstream's
+# npm-audit.yml runs daily on paid runners and fails on low severity; this
+# fails on high or critical only.
+name: Fork Audit NPM Packages
+
+on:
+  schedule:
+    - cron: "0 17 * * 1" # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Audit ${{ matrix.directory }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        directory:
+          - apps/api
+          - apps/playwright-service-ts
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: develop
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4
+        with:
+          version: 11.4.0
+
+      - name: Audit
+        run: pnpm dlx audit-ci@^7 --directory ${{ matrix.directory }} --high
