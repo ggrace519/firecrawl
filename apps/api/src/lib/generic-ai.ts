@@ -26,6 +26,7 @@ const providerList: Record<Provider, any> = {
   openai: createOpenAI({
     apiKey: config.OPENAI_API_KEY,
     baseURL: config.OPENAI_BASE_URL,
+    headers: config.OPENAI_HEADERS,
   }), //OPENAI_API_KEY
   ollama: createOllama({
     baseURL: config.OLLAMA_BASE_URL,

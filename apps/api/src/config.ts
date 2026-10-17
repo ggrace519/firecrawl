@@ -13,6 +13,18 @@ const delimitedList = (separator = ",") => {
 const emptyStringAsUndefined = <T extends z.ZodTypeAny>(schema: T) =>
   z.preprocess(value => (value === "" ? undefined : value), schema.optional());
 
+const jsonStringRecord = z.preprocess(
+  value => {
+    if (typeof value !== "string") return value;
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value; // left as a string so the record check reports it
+    }
+  },
+  z.record(z.string(), z.string()),
+);
+
 const emptyStringAsDefault = <T extends z.ZodTypeAny>(schema: T) =>
   z.preprocess(value => (value === "" ? undefined : value), schema);
 
@@ -187,6 +199,10 @@ const configSchema = z.object({
   ),
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.string().optional(),
+  // Extra headers sent with every OpenAI-provider request, as a JSON object,
+  // e.g. {"CF-Access-Client-Id":"…","CF-Access-Client-Secret":"…"} for an
+  // OPENAI_BASE_URL behind Cloudflare Access.
+  OPENAI_HEADERS: emptyStringAsUndefined(jsonStringRecord),
   OPENROUTER_API_KEY: z.string().optional(),
   XAI_API_KEY: z.string().optional(),
   LLAMAPARSE_API_KEY: z.string().optional(),
