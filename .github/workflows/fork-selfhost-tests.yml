@@ -49,6 +49,8 @@ jobs:
       OPENAI_API_KEY: ${{ matrix.ai == 'openai' && secrets.OPENAI_API_KEY || '' }}
       OPENAI_BASE_URL: ${{ matrix.ai == 'openai' && secrets.OPENAI_BASE_URL || '' }}
       MODEL_NAME: ${{ matrix.ai == 'openai' && secrets.MODEL_NAME || '' }}
+      # The model server is behind Cloudflare Access; send its service token.
+      OPENAI_HEADERS: ${{ matrix.ai == 'openai' && secrets.CF_ACCESS_CLIENT_ID && format('{{"CF-Access-Client-Id":"{0}","CF-Access-Client-Secret":"{1}"}}', secrets.CF_ACCESS_CLIENT_ID, secrets.CF_ACCESS_CLIENT_SECRET) || '' }}
       GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
       SEARXNG_ENDPOINT: ${{ matrix.search == 'searxng' && 'http://localhost:3434' || '' }}
       PLAYWRIGHT_MICROSERVICE_URL: ${{ matrix.engine == 'playwright' && 'http://localhost:3003/scrape' || '' }}
@@ -215,6 +217,11 @@ jobs:
         working-directory: apps/api
         env:
           npm_config_ignore_scripts: 'true'
+
+      - name: Run fork OPENAI_HEADERS regression tests
+        if: matrix.engine == 'fetch' && matrix.proxy == 'no-proxy' && matrix.nuq == 'postgres'
+        run: pnpm exec vitest run src/lib/generic-ai.headers.test.ts --reporter=default
+        working-directory: apps/api
 
       - name: Run Exchange terms compatibility regression tests
         if: matrix.engine == 'fetch' && matrix.proxy == 'no-proxy' && matrix.nuq == 'postgres'
