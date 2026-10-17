@@ -48,7 +48,7 @@ jobs:
       # address), so AI tests go through the Chat Completions patch.
       OPENAI_API_KEY: ${{ matrix.ai == 'openai' && secrets.OPENAI_API_KEY || '' }}
       OPENAI_BASE_URL: ${{ matrix.ai == 'openai' && secrets.OPENAI_BASE_URL || '' }}
-      MODEL_NAME: ${{ matrix.ai == 'openai' && vars.MODEL_NAME || '' }}
+      MODEL_NAME: ${{ matrix.ai == 'openai' && secrets.MODEL_NAME || '' }}
       GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
       SEARXNG_ENDPOINT: ${{ matrix.search == 'searxng' && 'http://localhost:3434' || '' }}
       PLAYWRIGHT_MICROSERVICE_URL: ${{ matrix.engine == 'playwright' && 'http://localhost:3003/scrape' || '' }}
