@@ -26,7 +26,7 @@ jobs:
         engine: ['playwright', 'fetch']
         proxy: ['no-proxy'] # the fork has no proxy credentials
         search: ['searxng']
-        ai: ['openai'] # AI tests run only when the OPENAI_API_KEY secret is set
+        ai: ['openai'] # AI tests run only when the OPENAI_API_KEY secret is set (see OPENAI_BASE_URL below)
         nuq: ['postgres']
     runs-on: ubuntu-latest
     services:
@@ -44,7 +44,12 @@ jobs:
       TEST_SUITE_WEBSITE: http://127.0.0.1:4321
       TEST_API_KEY: test
       TEST_TEAM_ID: bypass
+      # The fork's own OpenAI-compatible model server (reached via its public
+      # address), so AI tests go through the Chat Completions patch.
       OPENAI_API_KEY: ${{ matrix.ai == 'openai' && secrets.OPENAI_API_KEY || '' }}
+      OPENAI_BASE_URL: ${{ matrix.ai == 'openai' && secrets.OPENAI_BASE_URL || '' }}
+      MODEL_NAME: ${{ matrix.ai == 'openai' && vars.MODEL_NAME || '' }}
+      MODEL_EMBEDDING_NAME: ${{ matrix.ai == 'openai' && vars.MODEL_EMBEDDING_NAME || '' }}
       GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
       SEARXNG_ENDPOINT: ${{ matrix.search == 'searxng' && 'http://localhost:3434' || '' }}
       PLAYWRIGHT_MICROSERVICE_URL: ${{ matrix.engine == 'playwright' && 'http://localhost:3003/scrape' || '' }}
