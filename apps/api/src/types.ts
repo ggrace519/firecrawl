@@ -163,6 +163,7 @@ export enum RateLimiterMode {
   Labs = "labs",
   Exchange = "exchange",
   ExchangeDiscover = "exchangeDiscover",
+  FreshFeed = "freshFeed",
 }
 
 export type AuthResponse =
@@ -172,6 +173,8 @@ export type AuthResponse =
       org_id?: string | null;
       api_key?: string;
       chunk: AuthCreditUsageChunk | null;
+      // The hosted MCP made the call, as verified in supaAuthenticateUser.
+      hostedMcp?: boolean;
     }
   | {
       success: false;

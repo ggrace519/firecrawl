@@ -9,6 +9,14 @@ const mockKeylessLimitBody = vi.fn().mockResolvedValue({
   error: "keyless limit reached",
   reason: "credits",
 });
+const providerToolsRefusal = {
+  success: false,
+  error: "An API key is required for provider tools.",
+  signup_url: "https://firecrawl.dev/k/token",
+};
+const mockKeylessProviderToolsBody = vi.fn(
+  (..._args: any[]) => providerToolsRefusal,
+);
 const mockProjectSearchTotalCredits = vi.fn(() => 0);
 
 vi.mock("../../../services/logging/log_job", () => ({
@@ -31,6 +39,8 @@ vi.mock("../../../lib/keyless", () => ({
   KEYLESS_FREE_TIER_LIMIT_MESSAGE: "keyless limit reached",
   adjustKeylessCredits: vi.fn().mockResolvedValue(undefined),
   keylessLimitBody: (...args: any[]) => mockKeylessLimitBody(...args),
+  keylessProviderToolsBody: (...args: any[]) =>
+    mockKeylessProviderToolsBody(...args),
   logKeylessCreditUsage: vi.fn().mockResolvedValue(undefined),
   reserveKeylessCredits: (...args: any[]) => mockReserveKeylessCredits(...args),
 }));
@@ -51,6 +61,10 @@ vi.mock("../../../lib/key-restriction", () => ({
   checkKeyEndpointRestriction: vi.fn().mockResolvedValue({ allowed: true }),
 }));
 
+vi.mock("../../../lib/alexandria-activity", () => ({
+  markAlexandriaActivity: vi.fn(),
+}));
+
 vi.mock("../../../lib/logger", () => ({
   logger: {
     info: vi.fn(),
@@ -62,6 +76,7 @@ vi.mock("../../../lib/logger", () => ({
 }));
 
 import { searchController } from "../search";
+import { markAlexandriaActivity } from "../../../lib/alexandria-activity";
 
 const TEAM_ID = "11111111-1111-1111-1111-111111111111";
 
@@ -212,7 +227,7 @@ describe("developer category code_searches ledger", () => {
       executeResult({ response: { web: [] } }),
     );
 
-    for (const categories of [undefined, ["github"]]) {
+    for (const categories of [undefined, ["pdf"]]) {
       mockLogResearchEndpoint.mockClear();
       const req = makeReq({
         query: "http client",
@@ -355,5 +370,195 @@ describe("gov category gov_searches ledger", () => {
 
     expect(mockReserveKeylessCredits).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(200);
+  });
+});
+
+describe("tool discovery availability", () => {
+  const unavailable = executeResult({
+    response: { tools: [] },
+    totalResultsCount: 0,
+    indexResultsCount: 0,
+    searchCredits: 0,
+    totalCredits: 0,
+    toolsWarning: "Some tool discovery results are unavailable.",
+    toolsUnavailable: true,
+  });
+
+  it("answers a retryable 503 when a tools-only search finds nothing because discovery failed", async () => {
+    mockExecuteSearch.mockResolvedValue(unavailable);
+    const res = makeRes();
+
+    await searchController(
+      makeReq({ query: "weather", sources: [{ type: "alexandria" }] }),
+      res,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success: false,
+        code: "TOOL_DISCOVERY_UNAVAILABLE",
+      }),
+    );
+    expect(mockLogSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ is_successful: false, credits_cost: 0 }),
+    );
+  });
+
+  it("keeps the partial success when web results answered", async () => {
+    mockExecuteSearch.mockResolvedValue({
+      ...unavailable,
+      response: { web: developerResults, tools: [] },
+      totalResultsCount: 2,
+    });
+    const res = makeRes();
+
+    await searchController(
+      makeReq({
+        query: "weather",
+        sources: [{ type: "web" }, { type: "alexandria" }],
+      }),
+      res,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success: true,
+        warning: "Some tool discovery results are unavailable.",
+      }),
+    );
+  });
+});
+
+describe("skill discovery source", () => {
+  const card = {
+    id: "official/search",
+    name: "Search",
+    description: "Find records",
+    source: "official",
+  };
+
+  it("returns skill cards without billing or reserving keyless credits", async () => {
+    mockProjectSearchTotalCredits.mockReturnValue(2);
+    mockExecuteSearch.mockResolvedValue(
+      executeResult({
+        response: { skills: [card] },
+        skillsDiscovered: true,
+        totalResultsCount: 0,
+        indexResultsCount: 0,
+        searchCredits: 0,
+        totalCredits: 0,
+      }),
+    );
+    const res = makeRes();
+
+    await searchController(
+      makeReq({ query: "records", sources: ["skills"] }),
+      res,
+    );
+
+    expect(mockReserveKeylessCredits).not.toHaveBeenCalled();
+    expect(mockExecuteSearch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sources: [{ type: "skills" }],
+      }),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success: true,
+        creditsUsed: 0,
+        data: { skills: [card] },
+      }),
+    );
+    expect(markAlexandriaActivity).toHaveBeenCalledWith(TEAM_ID);
+  });
+
+  it("answers 200 with empty cards when discovery produced nothing", async () => {
+    mockExecuteSearch.mockResolvedValue(
+      executeResult({
+        response: { skills: [] },
+        skillsDiscovered: false,
+        totalResultsCount: 0,
+        indexResultsCount: 0,
+        searchCredits: 0,
+        totalCredits: 0,
+        toolsUnavailable: true,
+      }),
+    );
+    const res = makeRes();
+
+    await searchController(
+      makeReq({ query: "records", sources: [{ type: "skills" }] }),
+      res,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ success: true, data: { skills: [] } }),
+    );
+    expect(markAlexandriaActivity).not.toHaveBeenCalled();
+  });
+
+  it("opens the feedback window for a successful lookup that matched nothing", async () => {
+    mockExecuteSearch.mockResolvedValue(
+      executeResult({
+        response: { skills: [] },
+        skillsDiscovered: true,
+        totalResultsCount: 0,
+        indexResultsCount: 0,
+        searchCredits: 0,
+        totalCredits: 0,
+      }),
+    );
+    const res = makeRes();
+
+    await searchController(
+      makeReq({ query: "records", sources: ["skills"] }),
+      res,
+    );
+
+    expect(markAlexandriaActivity).toHaveBeenCalledWith(TEAM_ID);
+  });
+
+  it("requires a query", async () => {
+    const res = makeRes();
+
+    await searchController(makeReq({ query: "  ", sources: ["skills"] }), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockExecuteSearch).not.toHaveBeenCalled();
+  });
+
+  it("refuses keyless and zero data retention the same way tool search does", async () => {
+    const keyless = makeRes();
+    await searchController(
+      {
+        ...makeReq({ query: "records", sources: ["skills"] }),
+        auth: { team_id: "preview_keyless_203.0.113.8" },
+      },
+      keyless,
+    );
+    expect(keyless.status).toHaveBeenCalledWith(403);
+    expect(keyless.json).toHaveBeenCalledWith(providerToolsRefusal);
+    expect(mockKeylessProviderToolsBody).toHaveBeenCalledWith(
+      "preview_keyless_203.0.113.8",
+      expect.objectContaining({ body: expect.any(Object) }),
+    );
+
+    const zdr = makeRes();
+    await searchController(
+      makeReq({
+        query: "records",
+        sources: ["skills"],
+        enterprise: ["zdr"],
+      }),
+      zdr,
+    );
+    expect(zdr.status).toHaveBeenCalledWith(403);
+    expect(mockExecuteSearch).not.toHaveBeenCalled();
   });
 });

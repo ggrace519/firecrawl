@@ -10,7 +10,12 @@ import {
 import { cacheKeyShape, tryGetCached } from "./cache";
 import { lookupAdoptableFirePdfJob } from "./lookup";
 import { buildFirePdfJobOptions, FirePdfAsyncFailure } from "./utils";
-import { firePdfTableFormat } from "./request-metadata";
+import { isUsOnly, US_DATA_REGION } from "../../../../../lib/us-only";
+import { isReservedCapacity } from "../../../../../lib/reserved-capacity";
+import {
+  buildFirePdfJobTrainingCapture,
+  firePdfTableFormat,
+} from "./request-metadata";
 
 type FirePdfByReferenceAttemptArgs = {
   meta: Meta;
@@ -147,6 +152,13 @@ export async function runFirePdfByReferenceAttempt(
         includeBlocks,
         pageMarkers,
         tableFormat: firePdfTableFormat(meta),
+        trainingCapture: buildFirePdfJobTrainingCapture(meta),
+        dataRegion: isUsOnly(meta.internalOptions.teamFlags ?? undefined)
+          ? US_DATA_REGION
+          : undefined,
+        reserved: isReservedCapacity(
+          meta.internalOptions.teamFlags ?? undefined,
+        ),
       }),
     );
     meta.abort.throwIfAborted();

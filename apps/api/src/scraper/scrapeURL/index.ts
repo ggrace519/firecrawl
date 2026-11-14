@@ -60,10 +60,15 @@ import {
   ProxySelectionError,
   ScrapeRetryLimitError,
   BrandingNotSupportedError,
-  XTwitterConfigurationError,
+  UsOnlyUnavailableError,
+  ReservedCapacityUnavailableError,
   ExchangeRefusedError,
 } from "./error";
 import { ScrapeRetryTracker } from "./retryTracker";
+import {
+  inWaterfallExperimentArm,
+  waterfallExperimentFor,
+} from "./waterfallExperiments";
 import { executeTransformers } from "./transformers";
 import { LLMRefusalError } from "./transformers/llmExtract";
 import { shouldCheckRobots } from "./shouldCheckRobots";
@@ -127,6 +132,8 @@ import {
   SAFE_MODE_LOGIN_ACTIONS,
 } from "../../lib/safe-mode";
 import { resolveThreatProtection } from "../../lib/threat-protection/request";
+import { isUsOnly, usOnlyLocationRefusal } from "../../lib/us-only";
+import { loadFirstScreen } from "../../lib/branding/jev";
 import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
 import { canonicalizeUrl } from "../../lib/threat-protection/providers/web-risk/canonicalize";
 
@@ -163,6 +170,12 @@ export type BrowserCookie = {
 };
 
 export type Meta = {
+  /** URL of the page's first screen captured for Jev's branding call (see
+   * the branding format's __experimental_screenshot and
+   * BRANDING_JEV_SCREENSHOT_PERCENT). Internal: never part of the document. */
+  brandingScreenshot?: string;
+  /** That screen's download, started as soon as the engine returns. */
+  brandingScreenshotImage?: ReturnType<typeof loadFirstScreen>;
   id: string;
   url: string;
   rewrittenUrl?: string;
@@ -268,6 +281,11 @@ export type Meta = {
     | undefined; // undefined: no prefetch yet, null: prefetch came back empty
   costTracking: CostTracking;
   winnerEngine?: Engine;
+  /** The `raw-` content-cache key of the PDF this scrape looked up through
+   * the fire-pdf cache service, stored with the URL index entry so a later
+   * index hit can ask whether fire-pdf holds a newer parse. A holder shared
+   * by reference, because engines run on a copy of meta. */
+  firePdfCacheKey?: { current?: string };
   abortHandle?: NodeJS.Timeout;
   audioCookies?: BrowserCookie[];
   /** Threat protection decisions made during this scrape, in order (mutable, like logs). */
@@ -583,6 +601,7 @@ async function buildMetaObject(
     imageOcrEnabled,
     costTracking,
     threatDecisions: [],
+    firePdfCacheKey: {},
     largePdfProcessing: {},
   };
 }
@@ -590,6 +609,7 @@ async function buildMetaObject(
 export type InternalOptions = {
   teamId: string;
   crawlId?: string;
+  origin?: string;
 
   priority?: number; // Passed along to fire-engine
   forceEngine?: Engine | Engine[];
@@ -606,7 +626,9 @@ export type InternalOptions = {
   saveScrapeResultToGCS?: boolean; // Passed along to fire-engine
   bypassBilling?: boolean;
   zeroDataRetention?: boolean;
-  teamFlags?: TeamFlags;
+  /** null: the team has no flags. Absent: not snapshotted, so a check that
+   * must fail closed treats the org as unresolved. */
+  teamFlags?: TeamFlags | null;
   /** Team's org, snapshotted from the request ACUC at acceptance (same
    * pattern as teamFlags). Rides the job payload so org-scoped blocklist
    * checks work without re-fetching the chunk. Required so a payload
@@ -971,12 +993,32 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
           break;
         } catch (error) {
           if (error instanceof WrappedEngineError) {
-            if (error.engine === "x-twitter") {
-              meta.logger.warn("X/Twitter scrape failed fatally.", {
+            const nextEngine = remainingEngines[0]?.engine;
+            const experiment = waterfallExperimentFor(
+              error.engine,
+              error.error,
+              nextEngine,
+            );
+            if (experiment) {
+              const testArm = inWaterfallExperimentArm(meta.id, experiment);
+              meta.logger.info("Waterfall experiment decision", {
+                experiment,
+                arm: testArm ? "test" : "control",
+                engine: error.engine,
+                nextEngine,
                 error: error.error,
               });
-              throw error.error;
-            } else if (error.error instanceof EngineError) {
+              if (testArm) {
+                enginePromises = enginePromises.filter(
+                  x => x.engine !== error.engine,
+                );
+                if (enginePromises.length === 0) {
+                  break;
+                }
+                continue;
+              }
+            }
+            if (error.error instanceof EngineError) {
               meta.logger.warn(
                 "Engine " + error.engine + " could not scrape the page.",
                 {
@@ -1019,7 +1061,8 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
               error.error instanceof ProxySelectionError ||
               error.error instanceof NoCachedDataError ||
               error.error instanceof AgentIndexOnlyError ||
-              error.error instanceof XTwitterConfigurationError ||
+              error.error instanceof UsOnlyUnavailableError ||
+              error.error instanceof ReservedCapacityUnavailableError ||
               error.error instanceof ExchangeRefusedError ||
               error.error instanceof ThirdPartyDataTermsRequiredError
             ) {
@@ -1166,6 +1209,7 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
 
     let document: Document = {
       markdown: engineResult.markdown,
+      warning: engineResult.warning,
       pages: engineResult.pages,
       blocks: engineResult.blocks,
       rawHtml: engineResult.html,
@@ -1217,6 +1261,12 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
           : warning;
     }
 
+    meta.brandingScreenshot = engineResult.brandingScreenshot;
+    // Download it while the transformers before branding run. It never
+    // rejects: an unreadable screen leaves Jev answering from page data.
+    meta.brandingScreenshotImage = engineResult.brandingScreenshot
+      ? loadFirstScreen(engineResult.brandingScreenshot, meta.logger)
+      : undefined;
     document = await executeTransformers(meta, document);
 
     // Set final span attributes
@@ -1306,6 +1356,23 @@ export async function scrapeURL(
           }
           internalOptions.threatProtection = tp.policy ?? undefined;
         }
+      }
+
+      // ZDR always verifies TLS, for every engine, even when the request asks
+      // to skip verification.
+      if (internalOptions.zeroDataRetention) {
+        options.skipTlsVerification = false;
+      }
+
+      const usOnlyLocationError = usOnlyLocationRefusal(
+        internalOptions.teamFlags ?? undefined,
+        options.location?.country,
+      );
+      if (usOnlyLocationError) {
+        return {
+          success: false,
+          error: new UsOnlyUnavailableError(usOnlyLocationError),
+        };
       }
 
       const meta = await buildMetaObject(
@@ -1408,7 +1475,9 @@ export async function scrapeURL(
                       url: urlToCheck,
                       zeroDataRetention:
                         internalOptions.zeroDataRetention || false,
+                      usOnly: isUsOnly(internalOptions.teamFlags ?? undefined),
                       location: options.location,
+                      skipTlsVerification: options.skipTlsVerification,
                     },
                     id,
                     meta.logger,
@@ -1866,6 +1935,13 @@ export async function scrapeURL(
           });
         } else if (error instanceof SSLError) {
           errorType = "SSLError";
+          // Engines don't know about ZDR; swap in the message that doesn't
+          // suggest skipTlsVerification, which ZDR overrides above.
+          if (meta.internalOptions.zeroDataRetention) {
+            const zdrError = new SSLError(false, true);
+            zdrError.stack = error.stack;
+            error = zdrError;
+          }
           meta.logger.warn("scrapeURL: SSL error", { error });
         } else if (error instanceof ActionError) {
           errorType = "ActionError";

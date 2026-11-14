@@ -2,7 +2,10 @@ import type { Meta } from "../../..";
 import type { PDFMode } from "../../../../../controllers/v2/types";
 import { fetch as undiciFetch } from "undici";
 import { AbortManagerThrownError } from "../../../lib/abortManager";
+import { isUsOnly, US_DATA_REGION } from "../../../../../lib/us-only";
+import { isReservedCapacity } from "../../../../../lib/reserved-capacity";
 import {
+  buildFirePdfJobTrainingCapture,
   buildFirePdfRequestMetadata,
   firePdfTableFormat,
 } from "./request-metadata";
@@ -117,6 +120,10 @@ export async function submitJob(args: SubmitArgs): Promise<SubmitOutcome> {
     fetchImpl,
   } = args;
   const scrapeId = meta.id;
+  const usOnly = isUsOnly(meta.internalOptions.teamFlags ?? undefined);
+  const reservedCapacity = isReservedCapacity(
+    meta.internalOptions.teamFlags ?? undefined,
+  );
 
   if (
     input.kind === "byReference" &&
@@ -161,6 +168,9 @@ export async function submitJob(args: SubmitArgs): Promise<SubmitOutcome> {
       includeBlocks,
       pageMarkers,
       tableFormat: firePdfTableFormat(meta),
+      trainingCapture: buildFirePdfJobTrainingCapture(meta),
+      dataRegion: usOnly ? US_DATA_REGION : undefined,
+      reserved: reservedCapacity,
     }),
   };
 

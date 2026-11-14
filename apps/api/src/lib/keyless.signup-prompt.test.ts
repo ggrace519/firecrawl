@@ -28,6 +28,7 @@ import {
   KEYLESS_FREE_TIER_LIMIT_MESSAGE,
   checkKeylessEligibility,
   keylessLimitBody,
+  keylessProviderToolsBody,
   keylessSignupUrlForIp,
   keylessTeamId,
   keylessTeamUuid,
@@ -36,6 +37,7 @@ import {
 import { trackKeylessPromptShown } from "./keyless-prompt-analytics";
 import { decryptKeylessSignupToken } from "./keyless-signup-link";
 import { logger } from "./logger";
+import { mintWorldIdCredential } from "./world-id";
 
 const TEST_KEY = "AAECAwQFBgcICQoLDA0ODw==";
 const IP = "203.0.113.8";
@@ -156,6 +158,46 @@ describe("keyless limit prompt", () => {
     expect(keylessSignupUrlForIp("unknown", "api", "limit")).toEqual({
       url: "https://www.firecrawl.dev/signin?utm_source=keyless&utm_medium=api",
     });
+  });
+});
+
+describe("keyless provider tools prompt", () => {
+  it("puts the caller's own link in the refusal and reports it", () => {
+    const body = keylessProviderToolsBody("preview_keyless_203.0.113.8", {
+      body: { origin: "cli" },
+    });
+
+    expect(decoded(body.signup_url)).toEqual({
+      ipv4: IP,
+      surface: "cli",
+      reason: "account_only_tool",
+    });
+    expect(body).toEqual({
+      success: false,
+      error: expect.stringMatching(
+        /^An API key is required for provider tools\. /,
+      ),
+      signup_url: body.signup_url,
+    });
+    expect(body.error).toContain(`${body.signup_url}\n`);
+    expect(trackKeylessPromptShown).toHaveBeenCalledExactlyOnceWith(
+      shown({ surface: "cli", reason: "account_only_tool", httpStatus: 403 }),
+    );
+  });
+
+  it("gives a World ID caller the regular signup link and reports nothing", () => {
+    const body = keylessProviderToolsBody(
+      `preview_keyless_wid_${"h".repeat(43)}`,
+      {
+        body: {},
+      },
+    );
+
+    expect(body.signup_url).toBe(
+      "https://www.firecrawl.dev/signin?utm_source=keyless&utm_medium=api",
+    );
+    expect(body.error).toContain(`${body.signup_url}\n`);
+    expect(trackKeylessPromptShown).not.toHaveBeenCalled();
   });
 });
 
@@ -334,6 +376,42 @@ describe("keyless eligibility signup link", () => {
     });
     // An IPv6 caller is not a keyless identity, so nothing is reported.
     expect(trackKeylessPromptShown).not.toHaveBeenCalled();
+  });
+
+  it("checks a forwarded World ID credential only while World ID is configured", async () => {
+    const original = {
+      WORLD_ID_CLIENT_ID: config.WORLD_ID_CLIENT_ID,
+      WORLD_ID_CLIENT_SECRET: config.WORLD_ID_CLIENT_SECRET,
+      WORLD_ID_CREDENTIAL_SECRET: config.WORLD_ID_CREDENTIAL_SECRET,
+      WORLD_ID_SUBJECT_SECRET: config.WORLD_ID_SUBJECT_SECRET,
+    };
+    try {
+      config.WORLD_ID_CLIENT_ID = "app_test";
+      config.WORLD_ID_CLIENT_SECRET = "client-secret";
+      config.WORLD_ID_CREDENTIAL_SECRET = "c".repeat(32);
+      config.WORLD_ID_SUBJECT_SECRET = "s".repeat(32);
+      const hash = "h".repeat(43);
+      const { credential } = mintWorldIdCredential(hash);
+      vi.mocked(checkKeylessEligibility).mockResolvedValue({ eligible: true });
+      const request = () => {
+        const req = eligibilityRequest();
+        req.headers["x-firecrawl-world-id"] = credential;
+        return req;
+      };
+
+      await keylessEligibilityController(request(), fakeRes());
+      await keylessEligibilityController(eligibilityRequest(), fakeRes());
+      config.WORLD_ID_CLIENT_SECRET = undefined;
+      await keylessEligibilityController(request(), fakeRes());
+
+      expect(vi.mocked(checkKeylessEligibility).mock.calls).toEqual([
+        [IP, `wid_${hash}`],
+        [IP, undefined],
+        [IP, undefined],
+      ]);
+    } finally {
+      Object.assign(config, original);
+    }
   });
 
   it("omits the link for an eligible IP unless asked", async () => {
