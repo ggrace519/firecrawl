@@ -1,6 +1,10 @@
 import express from "express";
 import request from "supertest";
 
+vi.mock("../../lib/billing-country", () => ({
+  billingCountryForTeam: vi.fn(async () => undefined),
+}));
+
 // The real exchangeRouter, authMiddleware and auth.ts; only I/O is mocked.
 const mocks = vi.hoisted(() => ({
   authChunk: vi.fn(),
@@ -251,6 +255,26 @@ describe("hosted MCP keys on the Exchange routes the agent calls", () => {
     expect(mocks.upstreamFetch).toHaveBeenCalledTimes(2);
   });
 
+  it.each([{ searchZDR: "forced-zdr" }, { searchZDR: "forced-anon" }])(
+    "refuses discover before any upstream call for a team with %o",
+    async flags => {
+      keyResolvesAs(flags);
+      const response = await send("get", "/exchange/discover?q=gdp", "header");
+      expect(response.status).toBe(403);
+      expect(response.body.error).toBe(
+        "Provider discovery does not support zero data retention.",
+      );
+      expect(mocks.upstreamFetch).not.toHaveBeenCalled();
+    },
+  );
+
+  it("proxies discover for a team that forces scrape ZDR only", async () => {
+    keyResolvesAs({ scrapeZDR: "forced" });
+    const response = await send("get", "/exchange/discover?q=gdp", "header");
+    expect(response.status).not.toBe(403);
+    expect(mocks.upstreamFetch).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     [200, true],
     [502, false],
@@ -317,10 +341,12 @@ describe("hosted MCP keys on the Exchange routes the agent calls", () => {
       expect(mocks.exchangeRequest.mock.calls.map(([arg]) => arg.path)).toEqual(
         ["/v1/provider-terms/requirements"],
       );
-      expect(mocks.acceptedProviders).toHaveBeenCalledWith(
-        "team-mcp",
-        "org-mcp",
-      );
+      const ledgerCall = mocks.acceptedProviders.mock.calls[0];
+      expect(ledgerCall.slice(0, 2)).toEqual(["team-mcp", "org-mcp"]);
+      expect(ledgerCall[3]).toEqual({
+        clientIp: expect.any(String),
+        billingCountry: undefined,
+      });
     });
 
     it("blocks retrieve when access is disabled for the key's organization", async () => {

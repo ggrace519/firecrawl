@@ -66,7 +66,7 @@ describe("calculateCreditsToBeBilled", () => {
     expect(credits).toBe(16);
   });
 
-  it("bills X/Twitter scrapes at 30 credits", async () => {
+  it("bills an X/Twitter scrape at the Exchange's price, with no X surcharge", async () => {
     const credits = await calculateCreditsToBeBilled(
       {
         formats: [{ type: "markdown" }],
@@ -79,16 +79,18 @@ describe("calculateCreditsToBeBilled", () => {
         metadata: {
           statusCode: 200,
           proxyUsed: "basic",
-          postprocessorsUsed: ["x-twitter"],
         },
       } as any,
       {
         totalCost: 0,
       } as any,
       {} as any,
+      undefined,
+      undefined,
+      { provider: { id: "x-com", creditsCost: 5, steps: [] } },
     );
 
-    expect(credits).toBe(30);
+    expect(credits).toBe(5);
   });
 
   it("bills enhanced proxy scrapes the same as basic ones", async () => {
@@ -446,6 +448,51 @@ const billWithDecisions = (args: {
 const successDocument = {
   metadata: { statusCode: 200, proxyUsed: "basic" },
 };
+
+describe("calculateCreditsToBeBilled — zero data retention", () => {
+  const bill = (
+    options: Record<string, unknown>,
+    zeroDataRetention: boolean,
+    flags: Record<string, unknown> = {},
+  ) =>
+    calculateCreditsToBeBilled(
+      { formats: [{ type: "markdown" }], ...options } as any,
+      { teamId: "team-id", orgId: null, zeroDataRetention },
+      { metadata: { statusCode: 200, proxyUsed: "basic" } } as any,
+      { totalCost: 0 } as any,
+      flags as any,
+    );
+
+  it("adds 1 credit per page by default", async () => {
+    expect(await bill({}, false)).toBe(1);
+    expect(await bill({}, true)).toBe(2);
+  });
+
+  it("adds the team's zdrCost when it is set", async () => {
+    expect(await bill({}, true, { zdrCost: 3 })).toBe(4);
+    expect(await bill({}, false, { zdrCost: 3 })).toBe(1);
+  });
+
+  it("stacks on format surcharges", async () => {
+    const json = { formats: [{ type: "json", schema: {} }] };
+    expect(await bill(json, false)).toBe(5);
+    expect(await bill(json, true)).toBe(6);
+  });
+
+  it("is not added on top of lockdown", async () => {
+    expect(await bill({ lockdown: true }, true)).toBe(5);
+  });
+
+  it.each(["audio", "video"])(
+    "drops the %s surcharge it refuses, but not under lockdown",
+    async type => {
+      const media = { formats: [{ type }] };
+      expect(await bill(media, false)).toBe(5);
+      expect(await bill(media, true)).toBe(2);
+      expect(await bill({ ...media, lockdown: true }, true)).toBe(9);
+    },
+  );
+});
 
 describe("calculateThreatScanCredits", () => {
   it("bills nothing for no decisions", () => {
